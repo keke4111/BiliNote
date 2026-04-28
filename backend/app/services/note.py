@@ -1,9 +1,11 @@
 import json
 import logging
 import os
+import re
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Any
+from typing import List, Optional, Tuple, Union, Any, Dict
+from urllib.parse import urlparse
 
 from fastapi import HTTPException
 from pydantic import HttpUrl
@@ -98,7 +100,7 @@ class NoteGenerator:
         grid_size: Optional[List[int]] = None,
     ) -> NoteResult | None:
         """
-        主流程：按步骤依次下载、转写、GPT 总结、截图/链接处理、存库、返回 NoteResult。
+        主流程：按步骤依次下载、转写、大模型总结、截图/链接处理、存库、返回 NoteResult。
 
         :param video_url: 视频或音频链接
         :param platform: 平台名称，对应 SUPPORT_PLATFORM_MAP 中的键
@@ -199,7 +201,7 @@ class NoteGenerator:
                     task_id=task_id,
                 )
 
-            # 3. GPT 总结
+            # 3. 大模型总结
             markdown = self._summarize_text(
                 audio_meta=audio_meta,
                 transcript=transcript,
@@ -251,7 +253,193 @@ class NoteGenerator:
         logger.info(f"删除笔记记录 (video_id={video_id}, platform={platform})")
         return delete_task_by_video(video_id, platform)
 
+    @staticmethod
+    def clear_task_cache(task_id: str) -> Dict[str, List[str]]:
+        """
+        删除某个 task_id 对应的本地可再生缓存文件。
+        仅清理允许目录内的文件，不删除用户原始素材。
+        """
+        project_root = Path.cwd().resolve()
+        note_output_dir = NOTE_OUTPUT_DIR.resolve()
+        data_dir = (project_root / "data" / "data").resolve()
+        screenshot_dir = (project_root / "static" / "screenshots").resolve()
+        cover_dir = (project_root / "static" / "cover").resolve()
+        allowed_roots = [note_output_dir, data_dir, screenshot_dir, cover_dir]
+
+        result: Dict[str, List[str]] = {
+            "deleted": [],
+            "missing": [],
+            "skipped": [],
+        }
+        processed: set[str] = set()
+        extra_allowed_files: set[str] = set()
+
+        task_files = [
+            note_output_dir / f"{task_id}.json",
+            note_output_dir / f"{task_id}.status.json",
+            note_output_dir / f"{task_id}_audio.json",
+            note_output_dir / f"{task_id}_transcript.json",
+            note_output_dir / f"{task_id}_markdown.md",
+            note_output_dir / f"{task_id}_video_images.json",
+        ]
+
+        note_payload = NoteGenerator._load_json_if_exists(note_output_dir / f"{task_id}.json")
+        audio_payload = NoteGenerator._load_json_if_exists(note_output_dir / f"{task_id}_audio.json")
+
+        note_audio_meta = (note_payload or {}).get("audio_meta") or {}
+        audio_meta = note_audio_meta or (audio_payload or {})
+        markdown_text = (note_payload or {}).get("markdown") or ""
+        cover_url = audio_meta.get("cover_url") or ""
+        video_id = audio_meta.get("video_id") or ""
+        audio_file_path = audio_meta.get("file_path") or ""
+        video_path = audio_meta.get("video_path") or ""
+        platform = audio_meta.get("platform") or ""
+        source_url = NoteGenerator._extract_source_link(markdown_text)
+        raw_source_path = NoteGenerator._resolve_candidate_path(source_url)
+
+        candidates: list[Path] = []
+        candidates.extend(task_files)
+
+        if video_id:
+            candidates.extend(data_dir.glob(f"{video_id}.*"))
+            candidates.extend(data_dir.glob(f"{video_id}_cover.*"))
+
+        if audio_file_path:
+            resolved_audio_file = NoteGenerator._resolve_candidate_path(audio_file_path)
+            if resolved_audio_file:
+                candidates.append(resolved_audio_file)
+                if platform == "local":
+                    extra_allowed_files.add(str(resolved_audio_file))
+                else:
+                    for ext in [".mp4", ".mkv", ".webm", ".flv", ".m4a", ".wav"]:
+                        candidates.append(resolved_audio_file.with_suffix(ext))
+
+        if video_path:
+            resolved_video_path = NoteGenerator._resolve_candidate_path(video_path)
+            if resolved_video_path:
+                candidates.append(resolved_video_path)
+
+        for filename in set(re.findall(r"/static/screenshots/([A-Za-z0-9._-]+)", markdown_text)):
+            candidates.append(screenshot_dir / filename)
+
+        local_cover_path = NoteGenerator._cover_url_to_local_path(cover_url, project_root)
+        if local_cover_path:
+            candidates.append(local_cover_path)
+
+        if platform == "local":
+            if raw_source_path:
+                result["skipped"].append(str(raw_source_path))
+                derived_local_cover = raw_source_path.with_name(f"{raw_source_path.stem}_cover.jpg")
+                candidates.append(derived_local_cover)
+                extra_allowed_files.add(str(derived_local_cover))
+
+        for candidate in candidates:
+            NoteGenerator._remove_cache_path(
+                candidate=candidate,
+                allowed_roots=allowed_roots,
+                extra_allowed_files=extra_allowed_files,
+                result=result,
+                processed=processed,
+            )
+
+        logger.info(
+            "缓存清理完成 (task_id=%s, deleted=%s, missing=%s, skipped=%s)",
+            task_id,
+            len(result["deleted"]),
+            len(result["missing"]),
+            len(result["skipped"]),
+        )
+        return result
+
     # ---------------- 私有方法 ----------------
+
+    @staticmethod
+    def _load_json_if_exists(path: Path) -> Optional[dict]:
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(f"读取缓存文件失败，跳过解析 ({path}): {exc}")
+            return None
+
+    @staticmethod
+    def _resolve_candidate_path(path_like: Union[str, Path, None]) -> Optional[Path]:
+        if not path_like:
+            return None
+        candidate = Path(path_like)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        try:
+            return candidate.resolve()
+        except Exception:
+            return candidate.absolute()
+
+    @staticmethod
+    def _is_within(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _cover_url_to_local_path(cover_url: str, project_root: Path) -> Optional[Path]:
+        if not cover_url:
+            return None
+        parsed = urlparse(cover_url)
+        path = parsed.path or cover_url
+        if "/static/cover/" not in path:
+            return None
+        filename = Path(path).name
+        if not filename:
+            return None
+        return (project_root / "static" / "cover" / filename).resolve()
+
+    @staticmethod
+    def _extract_source_link(markdown: str) -> Optional[str]:
+        if not markdown:
+            return None
+        match = re.search(r"^>\s*来源链接：\s*(.+)$", markdown, re.MULTILINE)
+        if not match:
+            return None
+        return match.group(1).strip()
+
+    @staticmethod
+    def _remove_cache_path(
+        candidate: Path,
+        allowed_roots: List[Path],
+        extra_allowed_files: set[str],
+        result: Dict[str, List[str]],
+        processed: set[str],
+    ) -> None:
+        resolved = NoteGenerator._resolve_candidate_path(candidate)
+        if resolved is None:
+            return
+
+        key = str(resolved)
+        if key in processed:
+            return
+        processed.add(key)
+
+        if not any(NoteGenerator._is_within(resolved, root) for root in allowed_roots) and key not in extra_allowed_files:
+            result["skipped"].append(key)
+            return
+
+        if not resolved.exists():
+            result["missing"].append(key)
+            return
+
+        if not resolved.is_file():
+            result["skipped"].append(key)
+            return
+
+        try:
+            resolved.unlink()
+            result["deleted"].append(key)
+        except Exception as exc:
+            logger.warning(f"删除缓存文件失败，已跳过 ({resolved}): {exc}")
+            result["skipped"].append(key)
 
     def _init_transcriber(self) -> Transcriber:
         """
@@ -275,7 +463,7 @@ class NoteGenerator:
         if not provider:
             logger.error(f"[get_gpt] 未找到模型供应商: provider_id={provider_id}")
             raise ProviderError(code=ProviderErrorEnum.NOT_FOUND,message=ProviderErrorEnum.NOT_FOUND.message)
-        logger.info(f"创建 GPT 实例 {provider_id}")
+        logger.info(f"创建大模型调用实例 {provider_id}")
         config = ModelConfig(
             api_key=provider["api_key"],
             base_url=provider["base_url"],
@@ -308,7 +496,13 @@ class NoteGenerator:
         logger.info(f"使用下载器：{downloader_cls.__class__}")
         return instance
 
-    def _update_status(self, task_id: Optional[str], status: Union[str, TaskStatus], message: Optional[str] = None):
+    def _update_status(
+        self,
+        task_id: Optional[str],
+        status: Union[str, TaskStatus],
+        message: Optional[str] = None,
+        progress: Optional[dict] = None,
+    ):
         """
         创建或更新 {task_id}.status.json，记录当前任务状态
 
@@ -325,6 +519,8 @@ class NoteGenerator:
         data = {"status": status.value if isinstance(status, TaskStatus) else status}
         if message:
             data["message"] = message
+        if progress:
+            data["progress"] = progress
 
         try:
             # First create a temporary file
@@ -355,7 +551,93 @@ class NoteGenerator:
                 error_message = json.dumps(error_message, ensure_ascii=False)
             except:
                 error_message = str(error_message)
+        error_message = re.sub(r"\x1b\[[0-9;]*m", "", str(error_message)).replace("\r", " ").strip()
+        if "[download] Got error" in error_message:
+            error_message = "视频下载连接中断，请重试；如果反复出现，请降低视频质量或稍后再试。"
         self._update_status(task_id, TaskStatus.FAILED, message=error_message)
+
+    def _load_video_images_cache(
+        self,
+        cache_file: Path,
+        frame_interval: int,
+        grid_size: List[int],
+    ) -> Optional[List[str]]:
+        if not cache_file.exists():
+            return None
+
+        try:
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            if data.get("video_interval") != frame_interval:
+                return None
+            if data.get("grid_size") != grid_size:
+                return None
+
+            image_urls = data.get("video_img_urls") or []
+            if not isinstance(image_urls, list):
+                return None
+
+            existing_urls = []
+            for image_url in image_urls:
+                if isinstance(image_url, str) and image_url.startswith("data:image/"):
+                    existing_urls.append(image_url)
+                    continue
+
+                image_path = Path(str(image_url))
+                if not image_path.is_absolute():
+                    image_path = Path.cwd() / image_path
+                if image_path.exists():
+                    existing_urls.append(str(image_url))
+
+            if len(existing_urls) != len(image_urls):
+                logger.info(f"视频理解图片缓存不完整，将重新生成 ({cache_file})")
+                return None
+
+            logger.info(f"复用视频理解图片缓存，共 {len(existing_urls)} 张 ({cache_file})")
+            return existing_urls
+        except Exception as exc:
+            logger.warning(f"读取视频理解图片缓存失败，将重新生成：{exc}")
+            return None
+
+    def _save_video_images_cache(
+        self,
+        cache_file: Path,
+        frame_interval: int,
+        grid_size: List[int],
+        video_img_urls: List[str],
+    ) -> None:
+        try:
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "video_interval": frame_interval,
+                        "grid_size": grid_size,
+                        "video_img_urls": video_img_urls,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.warning(f"写入视频理解图片缓存失败：{exc}")
+
+    def _infer_cached_video_path(self, audio: Optional[AudioDownloadResult]) -> Optional[Path]:
+        if not audio or not getattr(audio, "file_path", None):
+            return None
+
+        audio_path = Path(audio.file_path)
+        candidates = [audio_path.with_suffix(ext) for ext in [".mp4", ".mkv", ".webm", ".flv"]]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        cached_video_path = getattr(audio, "video_path", None)
+        if cached_video_path:
+            candidate = Path(cached_video_path)
+            if candidate.exists():
+                return candidate
+
+        return None
 
     def _download_media(
         self,
@@ -391,14 +673,22 @@ class NoteGenerator:
         :return: AudioDownloadResult 对象
         """
         task_id = audio_cache_file.stem.split("_")[0]
-        self._update_status(task_id, status_phase)
+        self._update_status(task_id, status_phase, message="准备下载媒体")
+        need_video = screenshot or video_understanding
+        if screenshot and not grid_size:
+            grid_size = [2, 2]
+        frame_interval = video_interval if video_interval and video_interval > 0 else 6
+        video_images_cache_file = NOTE_OUTPUT_DIR / f"{task_id}_video_images.json"
+        cached_audio: Optional[AudioDownloadResult] = None
 
         # 已有缓存，尝试加载
         if audio_cache_file.exists():
             logger.info(f"检测到音频缓存 ({audio_cache_file})，直接读取")
             try:
                 data = json.loads(audio_cache_file.read_text(encoding="utf-8"))
-                return AudioDownloadResult(**data)
+                cached_audio = AudioDownloadResult(**data)
+                if not need_video:
+                    return cached_audio
             except Exception as e:
                 logger.warning(f"读取音频缓存失败，将重新下载：{e}")
 
@@ -422,28 +712,52 @@ class NoteGenerator:
             except Exception as exc:
                 logger.warning(f"元信息提取失败，将尝试完整下载: {exc}")
 
-        # 判断是否需要下载视频
-        need_video = screenshot or video_understanding
-        if screenshot and not grid_size:
-            grid_size = [2, 2]
-
-        frame_interval = video_interval if video_interval and video_interval > 0 else 6
         if need_video:
             try:
-                logger.info("开始下载视频")
-                video_path_str = downloader.download_video(video_url)
-                self.video_path = Path(video_path_str)
-                logger.info(f"视频下载完成：{self.video_path}")
+                cached_video_path = self._infer_cached_video_path(cached_audio)
+                if cached_video_path:
+                    self.video_path = cached_video_path
+                    logger.info(f"复用本地视频文件：{self.video_path}")
+                else:
+                    logger.info("开始下载视频")
+                    self._update_status(task_id, status_phase, message="正在下载原视频")
+                    video_path_str = downloader.download_video(video_url)
+                    self.video_path = Path(video_path_str)
+                    logger.info(f"视频下载完成：{self.video_path}")
 
                 if grid_size:
-                    self.video_img_urls = VideoReader(
-                        video_path=str(self.video_path),
-                        grid_size=tuple(grid_size),
-                        frame_interval=frame_interval,
-                        unit_width=960,
-                        unit_height=540,
-                        save_quality=80,
-                    ).run()
+                    cached_images = self._load_video_images_cache(
+                        video_images_cache_file,
+                        frame_interval,
+                        grid_size,
+                    )
+                    if cached_images is not None:
+                        self.video_img_urls = cached_images
+                    else:
+                        self._update_status(
+                            task_id,
+                            status_phase,
+                            message=f"正在按 {frame_interval}s 间隔提取视频截图并拼图",
+                        )
+                        self.video_img_urls = VideoReader(
+                            video_path=str(self.video_path),
+                            grid_size=tuple(grid_size),
+                            frame_interval=frame_interval,
+                            unit_width=960,
+                            unit_height=540,
+                            save_quality=80,
+                        ).run()
+                        self._save_video_images_cache(
+                            video_images_cache_file,
+                            frame_interval,
+                            grid_size,
+                            self.video_img_urls,
+                        )
+                        self._update_status(
+                            task_id,
+                            status_phase,
+                            message=f"视频截图处理完成，共 {len(self.video_img_urls)} 张拼图",
+                        )
                 else:
                     logger.info("未指定 grid_size，跳过缩略图生成")
             except Exception as exc:
@@ -451,9 +765,13 @@ class NoteGenerator:
                 self._handle_exception(task_id, exc)
                 raise
 
+        if cached_audio:
+            return cached_audio
+
         # 下载音频
         try:
             logger.info("开始下载音频")
+            self._update_status(task_id, status_phase, message="正在下载音频")
             audio = downloader.download(
                 video_url=video_url,
                 quality=quality,
@@ -461,6 +779,7 @@ class NoteGenerator:
                 need_video=need_video,
             )
             audio_cache_file.write_text(json.dumps(asdict(audio), ensure_ascii=False, indent=2), encoding="utf-8")
+            self._update_status(task_id, status_phase, message="音频下载完成")
             logger.info(f"音频下载并缓存成功 ({audio_cache_file})")
             return audio
         except Exception as exc:
@@ -592,8 +911,64 @@ class NoteGenerator:
         :param extras: GPT 额外参数
         :return: 生成的 Markdown 字符串
         """
-        task_id = markdown_cache_file.stem
-        self._update_status(task_id, TaskStatus.SUMMARIZING)
+        task_id = markdown_cache_file.stem.removesuffix("_markdown")
+        image_count = len(video_img_urls or [])
+        if image_count:
+            self._update_status(
+                task_id,
+                TaskStatus.SUMMARIZING,
+                message=f"正在向大模型发送文本和 {image_count} 张图片",
+                progress={
+                    "phase": "summarizing",
+                    "current": 0,
+                    "total": 1,
+                    "percent": 0,
+                    "detail": f"准备请求大模型，包含 {image_count} 张图片",
+                },
+            )
+        else:
+            self._update_status(
+                task_id,
+                TaskStatus.SUMMARIZING,
+                message="正在向大模型发送文本",
+                progress={
+                    "phase": "summarizing",
+                    "current": 0,
+                    "total": 1,
+                    "percent": 0,
+                    "detail": "准备请求大模型",
+                },
+            )
+
+        def on_llm_progress(progress: dict):
+            current = int(progress.get("current") or 0)
+            total = max(1, int(progress.get("total") or 1))
+            phase = progress.get("phase") or "summarizing"
+            image_count_for_chunk = int(progress.get("images") or 0)
+            detail = progress.get("detail")
+            if not detail:
+                if phase == "merge":
+                    detail = f"正在合并大模型分段结果：{current}/{total}"
+                else:
+                    detail = f"正在请求大模型：chunk {current}/{total}"
+                    if image_count_for_chunk:
+                        detail += f"，图片 {image_count_for_chunk} 张"
+            percent = progress.get("percent")
+            if percent is None:
+                percent = round(current / total * 100)
+
+            self._update_status(
+                task_id,
+                TaskStatus.SUMMARIZING,
+                message=detail,
+                progress={
+                    "phase": phase,
+                    "current": current,
+                    "total": total,
+                    "percent": max(0, min(100, int(percent))),
+                    "detail": detail,
+                },
+            )
 
         source = GPTSource(
             title=audio_meta.title,
@@ -606,15 +981,16 @@ class NoteGenerator:
             style=style,
             extras=extras,
             checkpoint_key=task_id,
+            progress_callback=on_llm_progress,
         )
 
         try:
             markdown = gpt.summarize(source)
             markdown_cache_file.write_text(markdown, encoding="utf-8")
-            logger.info(f"GPT 总结并缓存成功 ({markdown_cache_file})")
+            logger.info(f"大模型总结并缓存成功 ({markdown_cache_file})")
             return markdown
         except Exception as exc:
-            logger.error(f"GPT 总结失败：{exc}")
+            logger.error(f"大模型总结失败：{exc}")
             self._handle_exception(task_id, exc)
             raise
 

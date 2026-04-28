@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react'
-import { useModelStore } from '@/store/modelStore'
+import { useEffect, useState } from 'react'
+import toast from 'react-hot-toast'
+import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -8,14 +9,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Button } from '@/components/ui/button'
-import toast from 'react-hot-toast'
+import { useModelStore } from '@/store/modelStore'
 
 interface ModelSelectorProps {
   providerId: string
+  onSaved?: () => Promise<void> | void
 }
 
-export function ModelSelector({ providerId }: ModelSelectorProps) {
+export function ModelSelector({ providerId, onSaved }: ModelSelectorProps) {
   const { models, loading, selectedModel, loadModels, setSelectedModel, addNewModel } =
     useModelStore()
   const [search, setSearch] = useState('')
@@ -24,24 +25,26 @@ export function ModelSelector({ providerId }: ModelSelectorProps) {
   const filteredModels = models.filter(model => {
     const keywords = search.trim().toLowerCase().split(/\s+/)
     const target = model.id.toLowerCase()
-    return keywords.every(kw => target.includes(kw))
+    return keywords.every(keyword => target.includes(keyword))
   })
 
   useEffect(() => {
     if (providerId) {
       loadModels(providerId)
     }
-  }, [providerId])
+  }, [providerId, loadModels])
 
   const handleSubmit = async () => {
     if (!selectedModel) {
       toast.error('请选择一个模型')
       return
     }
+
     try {
       setSubmitting(true)
       await addNewModel(providerId, selectedModel)
-      toast.success('保存模型成功 🎉')
+      await onSaved?.()
+      toast.success('保存模型成功')
     } catch (error) {
       toast.error('保存失败')
     } finally {

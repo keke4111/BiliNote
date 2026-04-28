@@ -12,8 +12,11 @@ from app.gpt.prompt import BASE_PROMPT, AI_SUM, SCREENSHOT, LINK, MERGE_PROMPT
 from app.gpt.utils import fix_markdown
 from app.gpt.request_chunker import RequestChunker
 from app.models.transcriber_model import TranscriptSegment
+from app.utils.logger import get_logger
 from datetime import timedelta
 from typing import List
+
+logger = get_logger(__name__)
 
 
 class UniversalGPT(GPT):
@@ -198,7 +201,13 @@ class UniversalGPT(GPT):
             raise last_exc
         raise RuntimeError("chat completion failed without exception")
 
-    def _merge_partials(self, partials: list, checkpoint_key: str | None, source_signature: str | None) -> str:
+    def _merge_partials(
+        self,
+        partials: list,
+        checkpoint_key: str | None,
+        source_signature: str | None,
+        progress_callback=None,
+    ) -> str:
         def build_messages(texts, *_args, **_kwargs):
             return self._build_merge_messages(texts)
 
@@ -213,6 +222,14 @@ class UniversalGPT(GPT):
             groups = merge_chunker.group_texts_by_budget(current_partials, build_messages)
             new_partials = []
             for group_idx, group in enumerate(groups):
+                if callable(progress_callback):
+                    progress_callback({
+                        "phase": "merge",
+                        "current": group_idx + 1,
+                        "total": len(groups),
+                        "percent": round(90 + group_idx / max(1, len(groups)) * 10),
+                        "detail": f"正在合并大模型分段结果：{group_idx + 1}/{len(groups)}",
+                    })
                 messages = build_messages(group)
                 try:
                     response = self._chat_completion_create(messages)
@@ -222,6 +239,14 @@ class UniversalGPT(GPT):
                     raise
 
                 new_partials.append(response.choices[0].message.content.strip())
+                if callable(progress_callback):
+                    progress_callback({
+                        "phase": "merge",
+                        "current": group_idx + 1,
+                        "total": len(groups),
+                        "percent": round(90 + (group_idx + 1) / max(1, len(groups)) * 10),
+                        "detail": f"大模型分段结果合并完成：{group_idx + 1}/{len(groups)}",
+                    })
 
                 if checkpoint_key and source_signature:
                     remaining_partials = []
@@ -257,6 +282,7 @@ class UniversalGPT(GPT):
                 extras=source.extras
             )
         except ValueError:
+            logger.warning("当前请求过大，已去掉视频图片后重新分块")
             chunks = chunker.chunk(
                 source.segment,
                 [],
@@ -268,6 +294,18 @@ class UniversalGPT(GPT):
             )
 
         partials = []
+        total_images = sum(len(chunk.image_urls) for chunk in chunks)
+        progress_callback = getattr(source, "progress_callback", None)
+        logger.info(f"大模型总结开始: chunks={len(chunks)}, images={total_images}, model={self.model}")
+        if callable(progress_callback):
+            progress_callback({
+                "phase": "summarizing",
+                "current": 0,
+                "total": len(chunks),
+                "percent": 0,
+                "images": total_images,
+                "detail": f"大模型总结开始：共 {len(chunks)} 个请求分块，图片 {total_images} 张",
+            })
         if checkpoint_key and source_signature:
             checkpoint = self._load_checkpoint(checkpoint_key, source_signature)
             if checkpoint and isinstance(checkpoint.get("partials"), list):
@@ -276,7 +314,21 @@ class UniversalGPT(GPT):
         if len(partials) > len(chunks):
             partials = []
 
-        for chunk in chunks[len(partials):]:
+        for chunk_index, chunk in enumerate(chunks[len(partials):], start=len(partials) + 1):
+            logger.info(
+                f"大模型总结进度: chunk {chunk_index}/{len(chunks)}, "
+                f"segments={len(chunk.segments)}, images={len(chunk.image_urls)}"
+            )
+            if callable(progress_callback):
+                progress_callback({
+                    "phase": "summarizing",
+                    "current": chunk_index,
+                    "total": len(chunks),
+                    "percent": round((chunk_index - 1) / max(1, len(chunks)) * 90),
+                    "segments": len(chunk.segments),
+                    "images": len(chunk.image_urls),
+                    "detail": f"正在请求大模型：chunk {chunk_index}/{len(chunks)}，图片 {len(chunk.image_urls)} 张",
+                })
             messages = self.create_messages(
                 chunk.segments,
                 title=source.title,
@@ -294,6 +346,16 @@ class UniversalGPT(GPT):
                 raise
 
             partials.append(response.choices[0].message.content.strip())
+            if callable(progress_callback):
+                progress_callback({
+                    "phase": "summarizing",
+                    "current": chunk_index,
+                    "total": len(chunks),
+                    "percent": 100 if len(chunks) == 1 else round(chunk_index / max(1, len(chunks)) * 90),
+                    "segments": len(chunk.segments),
+                    "images": len(chunk.image_urls),
+                    "detail": f"大模型请求完成：chunk {chunk_index}/{len(chunks)}",
+                })
             if checkpoint_key and source_signature:
                 self._save_checkpoint(checkpoint_key, source_signature, partials, "summarize")
 
@@ -301,7 +363,8 @@ class UniversalGPT(GPT):
             if checkpoint_key:
                 self._clear_checkpoint(checkpoint_key)
             return partials[0]
-        merged = self._merge_partials(partials, checkpoint_key, source_signature)
+        logger.info(f"大模型分段总结完成，开始合并 {len(partials)} 段结果")
+        merged = self._merge_partials(partials, checkpoint_key, source_signature, progress_callback)
         if checkpoint_key:
             self._clear_checkpoint(checkpoint_key)
         return merged

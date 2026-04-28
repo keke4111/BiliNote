@@ -2,12 +2,13 @@
 import json
 import os
 import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File
-from pydantic import BaseModel, validator, field_validator
+from pydantic import BaseModel, Field, validator, field_validator
 from dataclasses import asdict
 
 from app.db.video_task_dao import get_task_by_video
@@ -15,6 +16,8 @@ from app.enmus.exception import NoteErrorEnum
 from app.enmus.note_enums import DownloadQuality
 from app.exceptions.note import NoteError
 from app.services.note import NoteGenerator, logger
+from app.services.note_backup import NotesBackupService
+from app.services.note_export import MarkdownBundleExporter
 from app.services.task_serial_executor import task_serial_executor
 from app.utils.response import ResponseWrapper as R
 from app.utils.url_parser import extract_video_id
@@ -33,6 +36,28 @@ router = APIRouter()
 class RecordRequest(BaseModel):
     video_id: str
     platform: str
+
+
+class TaskCacheRequest(BaseModel):
+    task_id: str
+
+
+class NotesStoreSnapshotRequest(BaseModel):
+    tasks: list = Field(default_factory=list)
+    categories: list = Field(default_factory=list)
+    deletedVersions: list = Field(default_factory=list)
+    currentTaskId: Optional[str] = None
+    schemaVersion: Optional[int] = None
+    exportedAt: Optional[str] = None
+
+
+class BackupImportRequest(BaseModel):
+    filename: str
+
+
+class MarkdownBundleExportRequest(BaseModel):
+    title: str = "note"
+    markdown: str = ""
 
 
 class VideoRequest(BaseModel):
@@ -127,6 +152,81 @@ def delete_task(data: RecordRequest):
         return R.error(msg=e)
 
 
+@router.post('/clear_task_cache')
+def clear_task_cache(data: TaskCacheRequest):
+    try:
+        cleared = NoteGenerator.clear_task_cache(data.task_id)
+        deleted_count = len(cleared.get("deleted", []))
+        missing_count = len(cleared.get("missing", []))
+        msg = f"缓存清理完成，已删除 {deleted_count} 个文件"
+        if missing_count:
+            msg += f"，{missing_count} 个文件原本不存在"
+        return R.success(data=cleared, msg=msg)
+    except Exception as e:
+        return R.error(msg=e)
+
+
+@router.post('/backup/sync_notes_store')
+def sync_notes_store(data: NotesStoreSnapshotRequest):
+    try:
+        result = NotesBackupService.sync_latest(data.model_dump())
+        return R.success(data=result, msg='笔记库备份已同步')
+    except Exception as e:
+        return R.error(msg=e)
+
+
+@router.get('/backup/notes_status')
+def get_notes_backup_status():
+    try:
+        result = NotesBackupService.get_status()
+        return R.success(data=result)
+    except Exception as e:
+        return R.error(msg=e)
+
+
+@router.post('/backup/export_notes_store')
+def export_notes_store(data: NotesStoreSnapshotRequest):
+    try:
+        result = NotesBackupService.export_snapshot(data.model_dump())
+        return R.success(data=result, msg='笔记库导出成功')
+    except Exception as e:
+        return R.error(msg=e)
+
+
+@router.get('/backup/list_note_backups')
+def list_note_backups():
+    try:
+        result = NotesBackupService.list_backups()
+        return R.success(data=result)
+    except Exception as e:
+        return R.error(msg=e)
+
+
+@router.post('/backup/import_notes_store')
+def import_notes_store(data: BackupImportRequest):
+    try:
+        result = NotesBackupService.load_backup_file(data.filename)
+        return R.success(data=result)
+    except Exception as e:
+        return R.error(msg=e)
+
+
+@router.post("/export_markdown_bundle")
+def export_markdown_bundle(data: MarkdownBundleExportRequest):
+    try:
+        content, filename = MarkdownBundleExporter.build_zip(data.title, data.markdown)
+        return StreamingResponse(
+            BytesIO(content),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename=\"note.zip\"; filename*=UTF-8''{quote(filename)}",
+            },
+        )
+    except Exception as e:
+        logger.exception(f"导出 Markdown 图片包失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/upload")
 async def upload(file: UploadFile = File(...)):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -183,6 +283,7 @@ def get_task_status(task_id: str):
 
         status = status_content.get("status")
         message = status_content.get("message", "")
+        progress = status_content.get("progress")
 
         if status == TaskStatus.SUCCESS.value:
             # 成功状态的话，继续读取最终笔记内容
@@ -193,6 +294,7 @@ def get_task_status(task_id: str):
                     "status": status,
                     "result": result_content,
                     "message": message,
+                    "progress": progress,
                     "task_id": task_id
                 })
             else:
@@ -204,12 +306,19 @@ def get_task_status(task_id: str):
                 })
 
         if status == TaskStatus.FAILED.value:
+            return R.success({
+                "status": status,
+                "message": message or "任务失败",
+                "progress": progress,
+                "task_id": task_id
+            })
             return R.error(message or "任务失败", code=500)
 
         # 处理中状态
         return R.success({
             "status": status,
             "message": message,
+            "progress": progress,
             "task_id": task_id
         })
 

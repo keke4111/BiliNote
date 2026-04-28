@@ -6,8 +6,6 @@ import toast from 'react-hot-toast'
 export const useTaskPolling = (interval = 3000) => {
   const tasks = useTaskStore(state => state.tasks)
   const updateTaskContent = useTaskStore(state => state.updateTaskContent)
-  const updateTaskStatus = useTaskStore(state => state.updateTaskStatus)
-  const removeTask = useTaskStore(state => state.removeTask)
 
   const tasksRef = useRef(tasks)
 
@@ -19,7 +17,7 @@ export const useTaskPolling = (interval = 3000) => {
   useEffect(() => {
     const timer = setInterval(async () => {
       const pendingTasks = tasksRef.current.filter(
-        task => task.status != 'SUCCESS' && task.status != 'FAILED'
+        task => !task.isDeleted && task.status != 'SUCCESS' && task.status != 'FAILED'
       )
 
       // 无活跃任务时跳过轮询
@@ -27,8 +25,8 @@ export const useTaskPolling = (interval = 3000) => {
 
       for (const task of pendingTasks) {
         try {
-          const res = await get_task_status(task.id)
-          const { status } = res
+          const res: any = await get_task_status(task.id)
+          const { status, message, progress } = res
 
           if (status && status !== task.status) {
             if (status === 'SUCCESS') {
@@ -39,17 +37,20 @@ export const useTaskPolling = (interval = 3000) => {
                 markdown,
                 transcript,
                 audioMeta: audio_meta,
+                message,
+                progress,
               })
             } else if (status === 'FAILED') {
-              updateTaskContent(task.id, { status })
+              updateTaskContent(task.id, { status, message, progress })
               console.warn(`⚠️ 任务 ${task.id} 失败`)
             } else {
-              updateTaskContent(task.id, { status })
+              updateTaskContent(task.id, { status, message, progress })
             }
+          } else if (status && ((message && message !== task.message) || progress)) {
+            updateTaskContent(task.id, { message, progress })
           }
         } catch (e) {
           console.error('❌ 任务轮询失败：', e)
-          updateTaskContent(task.id, { status: 'FAILED' })
         }
       }
     }, interval)

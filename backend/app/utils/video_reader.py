@@ -125,12 +125,18 @@ class VideoReader:
             images.append(img)
 
         cols, rows = self.grid_size
+        expected_images = cols * rows
         grid_img = Image.new("RGB", (self.unit_width * cols, self.unit_height * rows), (255, 255, 255))
 
         for i, img in enumerate(images):
             x = (i % cols) * self.unit_width
             y = (i // cols) * self.unit_height
             grid_img.paste(img, (x, y))
+
+        if len(images) < expected_images:
+            logger.info(
+                f"第 {name.split('_')[-1]} 组图片不足 {expected_images} 张，已使用空白格补齐（实际 {len(images)} 张）"
+            )
 
         save_path = os.path.join(self.grid_dir, f"{name}.jpg")
         grid_img.save(save_path, quality=self.save_quality)
@@ -167,9 +173,6 @@ class VideoReader:
             image_paths = []
             groups = self.group_images()
             for idx, group in enumerate(groups, start=1):
-                if len(group) < self.grid_size[0] * self.grid_size[1]:
-                    logger.warning(f"⚠️ 跳过第 {idx} 组，图片不足 {self.grid_size[0] * self.grid_size[1]} 张")
-                    continue
                 out_path = self.concat_images(group, f"grid_{idx}")
                 image_paths.append(out_path)
 

@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef, useMemo, memo, FC } from 'react'
+import { FC, memo, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { Button } from '@/components/ui/button.tsx'
-import { Copy, Download, ArrowRight, Play, ExternalLink } from 'lucide-react'
+import { ArrowRight, Copy, ExternalLink, Play, Save, X } from 'lucide-react'
 import { toast } from 'react-hot-toast'
 import Error from '@/components/Lottie/error.tsx'
 import Loading from '@/components/Lottie/Loading.tsx'
@@ -17,6 +17,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import 'github-markdown-css/github-markdown-light.css'
 import { ScrollArea } from '@/components/ui/scroll-area.tsx'
+import { Textarea } from '@/components/ui/textarea.tsx'
 import { useTaskStore } from '@/store/taskStore'
 import { noteStyles } from '@/constant/note.ts'
 import { MarkdownHeader } from '@/pages/HomePage/components/MarkdownHeader.tsx'
@@ -24,17 +25,11 @@ import TranscriptViewer from '@/pages/HomePage/components/transcriptViewer.tsx'
 import MarkmapEditor from '@/pages/HomePage/components/MarkmapComponent.tsx'
 import ChatPanel from '@/pages/HomePage/components/ChatPanel.tsx'
 import VideoBanner from '@/pages/HomePage/components/VideoBanner.tsx'
-
-interface VersionNote {
-  ver_id: string
-  content: string
-  style: string
-  model_name: string
-  created_at?: string
-}
+import { useMarkdownVersionState, type MarkdownVersion } from '@/features/notes'
+import { exportMarkdownBundle } from '@/services/note.ts'
 
 interface MarkdownViewerProps {
-  content: string | VersionNote[]
+  content?: string | MarkdownVersion[]
   status: 'idle' | 'loading' | 'success' | 'failed'
 }
 
@@ -42,17 +37,13 @@ const steps = [
   { label: '解析链接', key: 'PARSING' },
   { label: '下载音频', key: 'DOWNLOADING' },
   { label: '转写文字', key: 'TRANSCRIBING' },
-  { label: '总结内容', key: 'SUMMARIZING' },
+  { label: '大模型总结', key: 'SUMMARIZING' },
   { label: '保存完成', key: 'SUCCESS' },
 ]
 
 const remarkPlugins = [gfm, remarkMath]
 const rehypePlugins = [rehypeKatex]
 
-/**
- * 构建 ReactMarkdown components 对象，baseURL 用于修正图片路径。
- * 使用函数 + useMemo 避免每次渲染都创建新的函数实例。
- */
 function createMarkdownComponents(baseURL: string) {
   return {
     h1: ({ children, ...props }: any) => (
@@ -93,12 +84,12 @@ function createMarkdownComponents(baseURL: string) {
       </p>
     ),
     a: ({ href, children, ...props }: any) => {
-      const isOriginLink =
-        typeof children[0] === 'string' &&
-        (children[0] as string).startsWith('原片 @')
+      const firstChild = Array.isArray(children) ? children[0] : children
+      const text = typeof firstChild === 'string' ? firstChild : ''
+      const isOriginLink = text.startsWith('原片 @')
 
       if (isOriginLink) {
-        const timeMatch = (children[0] as string).match(/原片 @ (\d{2}:\d{2})/)
+        const timeMatch = text.match(/原片 @ (\d{2}:\d{2})/)
         const timeText = timeMatch ? timeMatch[1] : '原片'
 
         return (
@@ -126,24 +117,19 @@ function createMarkdownComponents(baseURL: string) {
           {...props}
         >
           {children}
-          {href?.startsWith('http') && (
-            <ExternalLink className="ml-0.5 inline-block h-3 w-3" />
-          )}
+          {href?.startsWith('http') && <ExternalLink className="ml-0.5 inline-block h-3 w-3" />}
         </a>
       )
     },
-    img: ({ node, ...props }: any) => {
-      let src = props.src
-      if (src.startsWith('/')) {
-        src = baseURL + src
-      }
-      props.src = src
+    img: ({ src = '', ...props }: any) => {
+      const resolvedSrc = src.startsWith('/') ? baseURL + src : src
 
       return (
         <div className="my-8 flex justify-center">
           <Zoom>
             <img
               {...props}
+              src={resolvedSrc}
               className="max-w-full cursor-zoom-in rounded-lg object-cover shadow-md transition-all hover:shadow-lg"
               style={{ maxHeight: '500px' }}
             />
@@ -161,9 +147,7 @@ function createMarkdownComponents(baseURL: string) {
       const isFakeHeading = /^(\*\*.+\*\*)$/.test(rawText.trim())
 
       if (isFakeHeading) {
-        return (
-          <div className="text-primary my-4 text-lg font-bold">{children}</div>
-        )
+        return <div className="text-primary my-4 text-lg font-bold">{children}</div>
       }
 
       return (
@@ -261,122 +245,138 @@ function createMarkdownComponents(baseURL: string) {
         {children}
       </td>
     ),
-    hr: ({ ...props }: any) => (
-      <hr className="border-muted-foreground/20 my-8" {...props} />
-    ),
+    hr: ({ ...props }: any) => <hr className="border-muted-foreground/20 my-8" {...props} />,
   }
 }
 
 const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
-  const [copied, setCopied] = useState(false)
-  const [currentVerId, setCurrentVerId] = useState<string>('')
-  const [selectedContent, setSelectedContent] = useState<string>('')
-  const [modelName, setModelName] = useState<string>('')
-  const [style, setStyle] = useState<string>('')
-  const [createTime, setCreateTime] = useState<string>('')
-  // 确保baseURL没有尾部斜杠
-  const baseURL = (String(import.meta.env.VITE_API_BASE_URL || '').replace('/api','') || '').replace(/\/$/, '')
-  const getCurrentTask = useTaskStore.getState().getCurrentTask
+  const baseURL = (
+    String(import.meta.env.VITE_API_BASE_URL || '').replace('/api', '') || ''
+  ).replace(/\/$/, '')
   const currentTask = useTaskStore(state => state.getCurrentTask())
+  const deleteMarkdownVersion = useTaskStore(state => state.deleteMarkdownVersion)
+  const saveEditedMarkdownVersion = useTaskStore(state => state.saveEditedMarkdownVersion)
+  const retryTask = useTaskStore(state => state.retryTask)
   const taskStatus = currentTask?.status || 'PENDING'
-  const retryTask = useTaskStore.getState().retryTask
-  const isMultiVersion = Array.isArray(currentTask?.markdown)
+  const markdownComponents = useMemo(() => createMarkdownComponents(baseURL), [baseURL])
+  const {
+    createTime,
+    currentVerId,
+    draftContent,
+    handleDeleteVersion,
+    isEditing,
+    isMultiVersion,
+    modelName,
+    saveEditing,
+    selectedContent,
+    setDraftContent,
+    setCurrentVerId,
+    startEditing,
+    cancelEditing,
+    style,
+  } = useMarkdownVersionState({
+    currentTask,
+    deleteMarkdownVersion,
+    saveEditedMarkdownVersion,
+  })
   const [showTranscribe, setShowTranscribe] = useState(false)
   const [showChat, setShowChat] = useState<false | 'half' | 'full'>(false)
   const [viewMode, setViewMode] = useState<'map' | 'preview'>('preview')
-  const svgRef = useRef<SVGSVGElement>(null)
 
-  // 缓存 ReactMarkdown components，仅在 baseURL 变化时重建
-  const markdownComponents = useMemo(() => createMarkdownComponents(baseURL), [baseURL])
-
-  // 多版本内容处理
-  useEffect(() => {
-    if (!currentTask) return
-
-    if (!isMultiVersion) {
-      setCurrentVerId('') // 清空旧版本 ID
-      setModelName(currentTask.formData.model_name)
-      setStyle(currentTask.formData.style)
-      setCreateTime(currentTask.createdAt)
-      setSelectedContent(currentTask?.markdown)
-    } else {
-      const latestVersion = [...currentTask.markdown].sort(
-        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-      )[0]
-
-      if (latestVersion) {
-        setCurrentVerId(latestVersion.ver_id)
-      }
-    }
-  }, [currentTask?.id, taskStatus])
-  useEffect(() => {
-    if (!currentTask || !isMultiVersion) return
-
-    const currentVer = currentTask.markdown.find(v => v.ver_id === currentVerId)
-    if (currentVer) {
-      setModelName(currentVer.model_name)
-      setStyle(currentVer.style)
-      setCreateTime(currentVer.created_at || '')
-      setSelectedContent(currentVer.content)
-    }
-  }, [currentVerId, currentTask?.id])
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(selectedContent)
-      setCopied(true)
       toast.success('已复制到剪贴板')
-      setTimeout(() => setCopied(false), 2000)
-    } catch (e) {
+    } catch {
       toast.error('复制失败')
     }
   }
-  const alertButton = {
-    id: 'alert',
-    title: '测试警告',
-    content: '⚠️',
-    onClick: () => alert('你点击了自定义按钮！'),
-  }
-  const exportButton = {
-    id: 'export',
-    title: '导出思维导图',
-    content: '⤓',
-    onClick: () => {
-      const svgEl = svgRef.current
-      if (!svgEl) return
-      // 同上面的序列化逻辑
-      const serializer = new XMLSerializer()
-      const source = serializer.serializeToString(svgEl)
-      const blob = new Blob(['<?xml version="1.0" encoding="UTF-8"?>', source], {
-        type: 'image/svg+xml;charset=utf-8',
-      })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = 'mindmap.svg'
-      a.click()
-      URL.revokeObjectURL(url)
-    },
-  }
+
   const handleDownload = () => {
-    const task = getCurrentTask()
-    const name = task?.audioMeta.title || 'note'
+    const name = currentTask?.audioMeta.title || 'note'
     const blob = new Blob([selectedContent], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
-    link.href = URL.createObjectURL(blob)
+    link.href = url
     link.download = `${name}.md`
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
+  const handleDownloadBundle = async () => {
+    if (!selectedContent) {
+      toast.error('当前没有可导出的 Markdown 内容')
+      return
+    }
+
+    try {
+      const title = currentTask?.audioMeta.title || 'note'
+      const { blob, filename } = await exportMarkdownBundle({
+        title,
+        markdown: selectedContent,
+      })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename || `${title}.zip`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+      toast.success('Markdown 图片包已导出')
+    } catch (error) {
+      console.error('导出 Markdown 图片包失败:', error)
+      toast.error('导出 Markdown 图片包失败')
+    }
+  }
+
+  const handleStartEditing = () => {
+    setViewMode('preview')
+    setShowChat(false)
+    setShowTranscribe(false)
+    startEditing()
   }
 
   if (status === 'loading') {
+    const progress = currentTask?.progress
+    const progressPercent =
+      typeof progress?.percent === 'number'
+        ? Math.max(0, Math.min(100, progress.percent))
+        : undefined
+
     return (
       <div className="flex h-screen w-full flex-col items-center justify-center space-y-4 text-neutral-500">
         <StepBar steps={steps} currentStep={taskStatus} />
-        <Loading className="h-5 w-5" />
+        <Loading />
+        {progress && progressPercent !== undefined && (
+          <div className="w-full max-w-xl space-y-2 px-4">
+            <div className="flex items-center justify-between gap-4 text-xs text-neutral-500">
+              <span className="truncate">
+                {progress.detail || currentTask?.message || '大模型处理中'}
+              </span>
+              <span className="font-mono">{progressPercent}%</span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-neutral-200">
+              <div
+                className="bg-primary h-full rounded-full transition-all duration-500"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
+            {progress.total > 1 && (
+              <div className="text-center text-xs text-neutral-400">
+                请求分块 {progress.current}/{progress.total}
+              </div>
+            )}
+          </div>
+        )}
+        {currentTask?.message && <p className="text-primary text-sm">{currentTask.message}</p>}
         <div className="text-center text-sm">
-          <p className="text-lg font-bold">正在生成笔记，请稍候…</p>
-          <p className="mt-2 text-xs text-neutral-500">这可能需要几秒钟时间，取决于视频长度</p>
+          <p className="text-lg font-bold">正在生成笔记，请稍候...</p>
+          <p className="mt-2 text-xs text-neutral-500">
+            这可能需要几分钟，取决于视频长度和大模型响应速度
+          </p>
         </div>
       </div>
     )
@@ -387,8 +387,8 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
       <div className="flex h-screen w-full flex-col items-center justify-center space-y-3 text-neutral-500">
         <Idle />
         <div className="text-center">
-          <p className="text-lg font-bold">输入视频链接并点击"生成笔记"</p>
-          <p className="mt-2 text-xs text-neutral-500">支持哔哩哔哩、YouTube 、抖音等视频平台</p>
+          <p className="text-lg font-bold">输入视频链接并点击“生成笔记”</p>
+          <p className="mt-2 text-xs text-neutral-500">支持哔哩哔哩、YouTube、抖音等视频平台</p>
         </div>
       </div>
     )
@@ -402,7 +402,7 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
           <p className="text-lg font-bold text-red-500">笔记生成失败</p>
           <p className="mt-2 mb-2 text-xs text-red-400">请检查后台或稍后再试</p>
 
-          <Button onClick={() => retryTask(currentTask.id)} size="lg">
+          <Button onClick={() => retryTask(currentTask?.id || '')} size="lg">
             重试
           </Button>
         </div>
@@ -422,6 +422,10 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
         noteStyles={noteStyles}
         onCopy={handleCopy}
         onDownload={handleDownload}
+        onDownloadBundle={handleDownloadBundle}
+        onDeleteVersion={handleDeleteVersion}
+        onStartEditing={handleStartEditing}
+        isEditing={isEditing}
         createAt={createTime}
         showTranscribe={showTranscribe}
         setShowTranscribe={setShowTranscribe}
@@ -433,11 +437,11 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
 
       {viewMode === 'map' ? (
         <div className="flex w-full flex-1 overflow-hidden bg-white">
-          <div className={'w-full'}>
+          <div className="w-full">
             <MarkmapEditor
               value={selectedContent}
               onChange={() => {}}
-              height="100%" // 根据需求可以设定百分比或固定高度
+              height="100%"
               title={currentTask?.audioMeta?.title || '思维导图'}
             />
           </div>
@@ -445,52 +449,73 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
       ) : (
         <div className="flex flex-1 overflow-hidden bg-white py-2">
           {selectedContent && selectedContent !== 'loading' && selectedContent !== 'empty' ? (
-            <>
-              {showChat === 'full' && currentTask ? (
-                <div className="h-full w-full">
-                  <ChatPanel taskId={currentTask.id} mode="full" onModeChange={setShowChat} />
+            isEditing ? (
+              <div className="flex h-full w-full flex-col overflow-hidden px-4 pb-4">
+                <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                  修改内容只保存在当前浏览器的本地笔记数据中，不会回写后端生成文件。
                 </div>
-              ) : (
-              <>
-              <ScrollArea className="min-w-0 flex-1">
-                <div className="px-2">
-                  <VideoBanner
-                    audioMeta={currentTask?.audioMeta}
-                    videoUrl={currentTask?.formData?.video_url}
+                <div className="min-h-0 flex-1">
+                  <Textarea
+                    value={draftContent}
+                    onChange={event => setDraftContent(event.target.value)}
+                    className="h-full min-h-full resize-none font-mono text-sm leading-6"
+                    placeholder="在这里编辑当前版本的 Markdown 内容"
                   />
                 </div>
-                <div className={'markdown-body w-full px-2'}>
-                  <ReactMarkdown
-                    remarkPlugins={remarkPlugins}
-                    rehypePlugins={rehypePlugins}
-                    components={markdownComponents}
-                  >
-                    {selectedContent.replace(/^>\s*来源链接：[^\n]*\n*/m, '')}
-                  </ReactMarkdown>
+                <div className="mt-3 flex items-center justify-end gap-2">
+                  <Button variant="outline" onClick={cancelEditing}>
+                    <X className="mr-1.5 h-4 w-4" />
+                    取消编辑
+                  </Button>
+                  <Button onClick={saveEditing}>
+                    <Save className="mr-1.5 h-4 w-4" />
+                    保存修改
+                  </Button>
                 </div>
-              </ScrollArea>
-              {showTranscribe && (
-                <div className={'ml-2 w-2/4'}>
-                  <TranscriptViewer />
-                </div>
-              )}
-              {/* 侧边问答模式：markdown + ChatPanel 各占一半 */}
-              {showChat === 'half' && currentTask && (
-                <div className="ml-2 h-full w-1/2 shrink-0">
-                  <ChatPanel taskId={currentTask.id} mode="half" onModeChange={setShowChat} />
-                </div>
-              )}
+              </div>
+            ) : showChat === 'full' && currentTask ? (
+              <div className="h-full w-full">
+                <ChatPanel taskId={currentTask.id} mode="full" onModeChange={setShowChat} />
+              </div>
+            ) : (
+              <>
+                <ScrollArea className="min-w-0 flex-1">
+                  <div className="px-2">
+                    <VideoBanner
+                      audioMeta={currentTask?.audioMeta}
+                      videoUrl={currentTask?.formData?.video_url}
+                    />
+                  </div>
+                  <div className="markdown-body w-full px-2">
+                    <ReactMarkdown
+                      remarkPlugins={remarkPlugins}
+                      rehypePlugins={rehypePlugins}
+                      components={markdownComponents}
+                    >
+                      {selectedContent.replace(/^>\s*来源链接：[^\n]*\n*/m, '')}
+                    </ReactMarkdown>
+                  </div>
+                </ScrollArea>
+                {showTranscribe && (
+                  <div className="ml-2 w-2/4">
+                    <TranscriptViewer />
+                  </div>
+                )}
+                {showChat === 'half' && currentTask && (
+                  <div className="ml-2 h-full w-1/2 shrink-0">
+                    <ChatPanel taskId={currentTask.id} mode="half" onModeChange={setShowChat} />
+                  </div>
+                )}
               </>
-              )}
-            </>
+            )
           ) : (
             <div className="flex h-full w-full items-center justify-center">
               <div className="w-[300px] flex-col justify-items-center">
                 <div className="bg-primary-light mb-4 flex h-16 w-16 items-center justify-center rounded-full">
                   <ArrowRight className="text-primary h-8 w-8" />
                 </div>
-                <p className="mb-2 text-neutral-600">输入视频链接并点击"生成笔记"按钮</p>
-                <p className="text-xs text-neutral-500">支持哔哩哔哩、YouTube等视频网站</p>
+                <p className="mb-2 text-neutral-600">输入视频链接并点击“生成笔记”按钮</p>
+                <p className="text-xs text-neutral-500">支持哔哩哔哩、YouTube 等视频网站</p>
               </div>
             </div>
           )}

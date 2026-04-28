@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Union, Optional
+from typing import Callable, List, Union, Optional
 
 from app.models.transcriber_model import TranscriptSegment
 
@@ -16,4 +16,5 @@ class GPTSource:
     _format: Optional[list] = None
     video_img_urls:  Optional[list] = None
     checkpoint_key: Optional[str] = None
+    progress_callback: Optional[Callable[[dict], None]] = None
 

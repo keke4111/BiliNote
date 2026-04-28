@@ -1,36 +1,25 @@
+import { useEffect, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { zodResolver } from '@hookform/resolvers/zod'
+import toast from 'react-hot-toast'
+import { X } from 'lucide-react'
+import { ModelSelector } from '@/components/Form/modelForm/ModelSelector.tsx'
+import { Button } from '@/components/ui/button'
 import {
   Form,
+  FormControl,
   FormField,
   FormItem,
   FormLabel,
-  FormControl,
   FormMessage,
-  FormDescription,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Button } from '@/components/ui/button'
-import { useParams, useNavigate } from 'react-router-dom'
-import { useProviderStore } from '@/store/providerStore'
-import { useEffect, useState } from 'react'
-import toast from 'react-hot-toast'
-import { testConnection, fetchModels, deleteModelById } from '@/services/model.ts'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select.tsx' // ⚡新增 fetchModels
-import { ModelSelector } from '@/components/Form/modelForm/ModelSelector.tsx'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert.tsx'
-import { Tags } from 'lucide-react'
-import { X } from 'lucide-react'
+import { deleteModelById, testConnection } from '@/services/model.ts'
 import { useModelStore } from '@/store/modelStore'
+import { useProviderStore } from '@/store/providerStore'
 
-// ✅ Provider表单schema
 const ProviderSchema = z.object({
   name: z.string().min(2, '名称不能少于 2 个字符'),
   apiKey: z.string().optional(),
@@ -40,41 +29,29 @@ const ProviderSchema = z.object({
 
 type ProviderFormValues = z.infer<typeof ProviderSchema>
 
-// ✅ Model表单schema
-const ModelSchema = z.object({
-  modelName: z.string().min(1, '请选择或填写模型名称'),
-})
-
-type ModelFormValues = z.infer<typeof ModelSchema>
-interface IModel {
+interface IModelListItem {
   id: string
-  created: number
-  object: string
-  owned_by: string
-  permission: string
-  root: string
+  provider_id: string
+  model_name: string
 }
+
 const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
-  let { id } = useParams()
+  const { id } = useParams()
   const navigate = useNavigate()
   const isEditMode = !isCreate
 
-  const getProviderById = useProviderStore(state => state.getProviderById)
   const loadProviderById = useProviderStore(state => state.loadProviderById)
   const updateProvider = useProviderStore(state => state.updateProvider)
   const addNewProvider = useProviderStore(state => state.addNewProvider)
+  const loadModelsById = useModelStore(state => state.loadModelsById)
+  const loadEnabledModels = useModelStore(state => state.loadEnabledModels)
+
   const [loading, setLoading] = useState(true)
   const [testing, setTesting] = useState(false)
   const [isBuiltIn, setIsBuiltIn] = useState(false)
-  const loadModelsById= useModelStore(state => state.loadModelsById)
-  const [modelOptions, setModelOptions] = useState<IModel[]>([]) // ⚡新增，保存模型列表
-  const [models, setModels]= useState([])
-  const [modelLoading, setModelLoading] = useState(false)
-  const randomColor = ()=>{
-    return '#' + Math.floor(Math.random() * 16777215).toString(16)
-  }
+  const [models, setModels] = useState<IModelListItem[]>([])
+  const [loadError, setLoadError] = useState('')
 
-  const [search, setSearch] = useState('')
   const providerForm = useForm<ProviderFormValues>({
     resolver: zodResolver(ProviderSchema),
     defaultValues: {
@@ -84,136 +61,123 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
       type: 'custom',
     },
   })
-  const filteredModelOptions = modelOptions.filter(model => {
-    const keywords = search.trim().toLowerCase().split(/\s+/) // 支持多个关键词
-    const target = model.id.toLowerCase()
-    return keywords.every(kw => target.includes(kw))
-  })
 
-  const modelForm = useForm<ModelFormValues>({
-    resolver: zodResolver(ModelSchema),
-    defaultValues: {
-      modelName: '',
-    },
-  })
+  const refreshEnabledModels = async (providerId: string) => {
+    const enabledModels = await loadModelsById(providerId)
+    setModels(enabledModels)
+    await loadEnabledModels()
+  }
 
   useEffect(() => {
+    let mounted = true
 
     const load = async () => {
-      if (isEditMode) {
+      setLoading(true)
+      setLoadError('')
 
-        const data = await loadProviderById(id!)
+      try {
+        if (!isEditMode) {
+          providerForm.reset({
+            name: '',
+            apiKey: '',
+            baseUrl: '',
+            type: 'custom',
+          })
+          setIsBuiltIn(false)
+          setModels([])
+          return
+        }
+
+        if (!id) {
+          setLoadError('供应商不存在或加载失败')
+          return
+        }
+
+        const data = await loadProviderById(id)
+        if (!mounted) return
+
+        if (!data) {
+          setLoadError('供应商不存在或加载失败')
+          return
+        }
+
         providerForm.reset(data)
         setIsBuiltIn(data.type === 'built-in')
-      } else {
-        providerForm.reset({
-          name: '',
-          apiKey: '',
-          baseUrl: '',
-          type: 'custom',
-        })
-        setIsBuiltIn(false)
-      }
-      const models = await loadModelsById(id!)
-      if(models){
-        console.log('🔧 模型列表:', models)
-        setModels(models)
 
+        const enabledModels = await loadModelsById(id)
+        if (!mounted) return
+        setModels(enabledModels)
+      } catch (error) {
+        console.error('加载供应商配置失败', error)
+        if (mounted) setLoadError('供应商不存在或加载失败')
+      } finally {
+        if (mounted) setLoading(false)
       }
-      setLoading(false)
     }
+
     load()
-  }, [id])
-  const handelDelete=async (modelId)=>{
+    return () => {
+      mounted = false
+    }
+  }, [id, isEditMode, loadModelsById, loadProviderById, providerForm])
+
+  const handleDelete = async (modelId: string) => {
+    if (!id) return
     if (!window.confirm('确定要删除这个模型吗？')) return
 
     try {
-      const res = await deleteModelById(modelId)
-      console.log('🔧 删除结果:', res)
-
+      await deleteModelById(Number(modelId))
+      await refreshEnabledModels(id)
       toast.success('删除成功')
-
-    } catch (e) {
+    } catch (error) {
       toast.error('删除异常')
     }
   }
-  // 测试连通性
+
   const handleTest = async () => {
     const values = providerForm.getValues()
     if (!values.apiKey || !values.baseUrl) {
       toast.error('请填写 API Key 和 Base URL')
       return
     }
+
+    if (!id) {
+      toast.error('请先保存供应商信息')
+      return
+    }
+
     try {
-      if (!id){
-        toast.error('请先保存供应商信息')
-        return
-      }
       setTesting(true)
-     await testConnection({
-             id
-          })
-
-        toast.success('测试连通性成功 🎉')
-
-    } catch (error) {
-
-      toast.error(`连接失败: ${data.data.msg || '未知错误'}`)
-      // toast.error('测试连通性异常')
+      await testConnection({ id })
+      toast.success('测试连通性成功')
+    } catch (error: any) {
+      toast.error(`连接失败: ${error?.msg || error?.message || '未知错误'}`)
     } finally {
       setTesting(false)
     }
   }
 
-  // 加载模型列表
-  const handleModelLoad = async () => {
-    const values = providerForm.getValues()
-    if (!values.apiKey || !values.baseUrl) {
-      toast.error('请先填写 API Key 和 Base URL')
-      return
-    }
-    try {
-      setModelLoading(true) // ✅ 开始 loading
-      const res = await fetchModels(id!, { noCache: true }) // 这里稍后解释
-      if (res.data.code === 0 && res.data.data.models.data.length > 0) {
-        setModelOptions(res.data.data.models.data)
-        console.log('🔧 模型列表:', res.data.data)
-        toast.success('模型列表加载成功 🎉')
-      } else {
-        toast.error('未获取到模型列表')
-      }
-    } catch (error) {
-      toast.error('加载模型列表失败')
-    } finally {
-      setModelLoading(false) // ✅ 结束 loading
-    }
-  }
-
-  // 保存Provider信息
   const onProviderSubmit = async (values: ProviderFormValues) => {
     if (isEditMode) {
       await updateProvider({ ...values, id: id! })
+      await loadEnabledModels()
       toast.success('更新供应商成功')
-    } else {
-       id = await addNewProvider({ ...values })
-
-      toast.success('新增供应商成功')
+      return
     }
-    // 刷新页面
 
-  }
-
-  // 保存Model信息
-  const onModelSubmit = async (values: ModelFormValues) => {
-    toast.success(`保存模型: ${values.modelName}`)
-    await loadModelsById(id!)
+    const createdId = await addNewProvider({ ...values })
+    if (createdId) {
+      await loadEnabledModels()
+      toast.success('新增供应商成功')
+      navigate(`/settings/model/${createdId}`)
+    }
   }
 
   if (loading) return <div className="p-4">加载中...</div>
+  if (loadError) return <div className="p-4 text-sm text-red-600">{loadError}</div>
 
   return (
     <div className="flex flex-col gap-8 p-4">
-      {/* Provider信息表单 */}
       <Form {...providerForm}>
         <form
           onSubmit={providerForm.handleSubmit(onProviderSubmit)}
@@ -223,10 +187,9 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
             {isEditMode ? '编辑模型供应商' : '新增模型供应商'}
           </div>
           {!isBuiltIn && (
-            <div className="text-sm text-red-500 italic">
-              自定义模型供应商需要确保兼容 OpenAI SDK
-            </div>
+            <div className="text-sm text-red-500 italic">自定义供应商需要兼容 OpenAI SDK。</div>
           )}
+
           <FormField
             control={providerForm.control}
             name="name"
@@ -240,6 +203,7 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
               </FormItem>
             )}
           />
+
           <FormField
             control={providerForm.control}
             name="apiKey"
@@ -253,6 +217,7 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
               </FormItem>
             )}
           />
+
           <FormField
             control={providerForm.control}
             name="baseUrl"
@@ -269,6 +234,7 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
               </FormItem>
             )}
           />
+
           <FormField
             control={providerForm.control}
             name="type"
@@ -282,6 +248,7 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
               </FormItem>
             )}
           />
+
           <div className="pt-2">
             <Button type="submit" disabled={!providerForm.formState.isDirty}>
               {isEditMode ? '保存修改' : '保存创建'}
@@ -290,47 +257,42 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
         </form>
       </Form>
 
-      {/* 模型信息表单 */}
       <div className="flex max-w-xl flex-col gap-4">
         <div className="flex flex-col gap-2">
           <span className="font-bold">模型列表</span>
-          <div className={'flex flex-col gap-2 rounded bg-[#FEF0F0] p-2.5'}>
-            <h2 className={'font-bold'}>注意!</h2>
-            <span>请确保已经保存供应商信息,以及通过测试连通性.</span>
+          <div className="flex flex-col gap-2 rounded bg-[#FEF0F0] p-2.5">
+            <h2 className="font-bold">注意</h2>
+            <span>请先保存供应商信息，并确认测试连通性通过后再保存模型。</span>
           </div>
-          <ModelSelector providerId={id!} />
-
-          {/*<datalist id="model-options">*/}
-          {/*  {modelOptions.map(model => (*/}
-          {/*    <option key={model.id + '1'} value={model.id} />*/}
-          {/*  ))}*/}
-          {/*</datalist>*/}
+          <ModelSelector
+            providerId={id!}
+            onSaved={async () => {
+              if (id) {
+                await refreshEnabledModels(id)
+              }
+            }}
+          />
         </div>
+
         <div className="flex flex-col gap-2">
           <span className="font-bold">已启用模型</span>
-          <div className={'flex flex-wrap gap-2 rounded  p-2.5'}>
-            {
-              models && models.map(model => {
-                return (
-                  <span key={model.id} className="inline-flex items-center gap-1 rounded-md bg-blue-100 px-2 py-0.5 text-sm text-blue-700">
-                    {model.model_name}
-                    <button type="button" onClick={() => handelDelete(model.id)} className="hover:text-blue-900">
-                      <X className="h-3 w-3" />
-                    </button>
-                  </span>
-
-                )
-              })
-            }
-
+          <div className="flex flex-wrap gap-2 rounded p-2.5">
+            {models.map(model => (
+              <span
+                key={model.id}
+                className="inline-flex items-center gap-1 rounded-md bg-blue-100 px-2 py-0.5 text-sm text-blue-700"
+              >
+                {model.model_name}
+                <button
+                  type="button"
+                  onClick={() => handleDelete(model.id)}
+                  className="hover:text-blue-900"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            ))}
           </div>
-          {/*<ModelSelector providerId={id!} />*/}
-
-          {/*<datalist id="model-options">*/}
-          {/*  {modelOptions.map(model => (*/}
-          {/*    <option key={model.id + '1'} value={model.id} />*/}
-          {/*  ))}*/}
-          {/*</datalist>*/}
         </div>
       </div>
     </div>

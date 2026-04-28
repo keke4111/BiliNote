@@ -2,10 +2,11 @@ import { useEffect, useState } from 'react'
 import request from '@/utils/request'
 
 const MAX_RETRIES = 3
-const RETRY_INTERVAL = 10000 // 10秒
+const RETRY_INTERVAL = 2000 // 2秒
+const SILENT_REQUEST = { silent: true } as any
 
 export const useCheckBackend = () => {
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [initialized, setInitialized] = useState(false)
 
   useEffect(() => {
@@ -13,7 +14,8 @@ export const useCheckBackend = () => {
 
     const check = async () => {
       try {
-        await request.get('/sys_check')
+        setLoading(true)
+        await request.get('/sys_check', SILENT_REQUEST)
         setInitialized(true)
         setLoading(false)
       } catch {
@@ -35,7 +37,7 @@ export const useCheckBackend = () => {
     const waitUntilBackendReady = async () => {
       while (true) {
         try {
-          await request.get('/sys_health')
+          await request.get('/sys_health', SILENT_REQUEST)
           setInitialized(true)
           setLoading(false)
           break
