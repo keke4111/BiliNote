@@ -30,6 +30,39 @@ MODEL_MAP={
     'large-v3-turbo':'pengzhendong/faster-whisper-large-v3-turbo',
 }
 
+MODEL_BIN_MIN_BYTES = {
+    "tiny": 50 * 1024 * 1024,
+    "base": 100 * 1024 * 1024,
+    "small": 300 * 1024 * 1024,
+    "medium": 1000 * 1024 * 1024,
+    "large-v3": 2000 * 1024 * 1024,
+    "large-v3-turbo": 1000 * 1024 * 1024,
+}
+
+
+def is_complete_model_dir(model_path: str, model_size: str) -> bool:
+    model_dir_path = Path(model_path)
+    model_bin = model_dir_path / "model.bin"
+    complete_marker = model_dir_path / ".download_complete"
+    metadata_files = [
+        model_dir_path / "config.json",
+        model_dir_path / "tokenizer.json",
+        model_dir_path / "vocabulary.json",
+    ]
+    if not model_dir_path.is_dir() or not model_bin.is_file():
+        return False
+
+    model_bin_size = model_bin.stat().st_size
+    has_metadata = any(path.is_file() and path.stat().st_size > 0 for path in metadata_files)
+    if not has_metadata:
+        return False
+
+    if complete_marker.is_file():
+        return model_bin_size > 0
+
+    return model_bin_size >= MODEL_BIN_MIN_BYTES.get(model_size, 1)
+
+
 class WhisperTranscriber(Transcriber):
     # TODO:修改为可配置
     def __init__(
@@ -50,7 +83,7 @@ class WhisperTranscriber(Transcriber):
 
         model_dir = get_model_dir("whisper")
         model_path = os.path.join(model_dir, f"whisper-{model_size}")
-        if not Path(model_path).exists():
+        if not is_complete_model_dir(model_path, model_size):
             logger.info(f"模型 whisper-{model_size} 不存在，开始下载...")
             repo_id = MODEL_MAP[model_size]
             model_path = snapshot_download(
@@ -58,6 +91,7 @@ class WhisperTranscriber(Transcriber):
 
                 local_dir=model_path,
             )
+            (Path(model_path) / ".download_complete").write_text("ok", encoding="utf-8")
             logger.info("模型下载完成")
 
         self.model = WhisperModel(

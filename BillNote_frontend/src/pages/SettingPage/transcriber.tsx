@@ -163,7 +163,9 @@ export default function Transcriber() {
                       <SelectItem key={size} value={size}>
                         <span className="flex items-center gap-2">
                           {size}
-                          {status?.downloaded && (
+                          {status?.downloading ? (
+                            <Loader2 className="h-3 w-3 animate-spin text-neutral-400" />
+                          ) : status?.downloaded && (
                             <CheckCircle2 className="h-3 w-3 text-green-500" />
                           )}
                         </span>
@@ -221,14 +223,14 @@ export default function Transcriber() {
                 >
                   <div className="flex items-center gap-3">
                     <span className="font-medium">{model.model_size}</span>
-                    {model.downloaded ? (
-                      <Badge variant="default" className="bg-green-500 hover:bg-green-600">
-                        已下载
-                      </Badge>
-                    ) : model.downloading ? (
+                    {model.downloading ? (
                       <Badge variant="secondary" className="flex items-center gap-1">
                         <Loader2 className="h-3 w-3 animate-spin" />
                         下载中
+                      </Badge>
+                    ) : model.downloaded ? (
+                      <Badge variant="default" className="bg-green-500 hover:bg-green-600">
+                        已下载
                       </Badge>
                     ) : (
                       <Badge variant="outline">未下载</Badge>

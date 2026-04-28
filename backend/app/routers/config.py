@@ -57,6 +57,15 @@ AVAILABLE_TRANSCRIBER_TYPES = [
 
 WHISPER_MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
 
+WHISPER_MODEL_MIN_BYTES = {
+    "tiny": 50 * 1024 * 1024,
+    "base": 100 * 1024 * 1024,
+    "small": 300 * 1024 * 1024,
+    "medium": 1000 * 1024 * 1024,
+    "large-v3": 2000 * 1024 * 1024,
+    "large-v3-turbo": 1000 * 1024 * 1024,
+}
+
 
 @router.get("/transcriber_config")
 def get_transcriber_config():
@@ -87,10 +96,30 @@ _downloading: dict[str, str] = {}  # model_size -> status ("downloading" | "done
 
 
 def _check_whisper_model_exists(model_size: str, subdir: str = "whisper") -> bool:
-    """检查指定 whisper 模型是否已下载到本地。"""
+    """检查指定 whisper 模型是否已完整下载到本地。"""
     model_dir = get_model_dir(subdir)
     model_path = os.path.join(model_dir, f"whisper-{model_size}")
-    return Path(model_path).exists()
+    model_dir_path = Path(model_path)
+    model_bin = model_dir_path / "model.bin"
+    complete_marker = model_dir_path / ".download_complete"
+    metadata_files = [
+        model_dir_path / "config.json",
+        model_dir_path / "tokenizer.json",
+        model_dir_path / "vocabulary.json",
+    ]
+    if not model_dir_path.is_dir() or not model_bin.is_file():
+        return False
+
+    model_bin_size = model_bin.stat().st_size
+    has_metadata = any(path.is_file() and path.stat().st_size > 0 for path in metadata_files)
+    if not has_metadata:
+        return False
+
+    if complete_marker.is_file():
+        return model_bin_size > 0
+
+    min_bytes = WHISPER_MODEL_MIN_BYTES.get(model_size, 1)
+    return model_bin_size >= min_bytes
 
 
 @router.get("/transcriber_models_status")
@@ -98,12 +127,13 @@ def get_transcriber_models_status():
     """返回所有 whisper 模型的下载状态。"""
     statuses = []
     for size in WHISPER_MODEL_SIZES:
-        downloaded = _check_whisper_model_exists(size, "whisper")
         download_status = _downloading.get(size)
+        downloading = download_status == "downloading"
+        downloaded = False if downloading else _check_whisper_model_exists(size, "whisper")
         statuses.append({
             "model_size": size,
             "downloaded": downloaded,
-            "downloading": download_status == "downloading",
+            "downloading": downloading,
         })
 
     # 也检查 mlx-whisper（仅 macOS）
@@ -142,7 +172,7 @@ def _do_download_whisper(model_size: str):
         _downloading[model_size] = "downloading"
         model_dir = get_model_dir("whisper")
         model_path = os.path.join(model_dir, f"whisper-{model_size}")
-        if Path(model_path).exists():
+        if _check_whisper_model_exists(model_size, "whisper"):
             _downloading[model_size] = "done"
             return
         repo_id = MODEL_MAP.get(model_size)
@@ -151,6 +181,7 @@ def _do_download_whisper(model_size: str):
             return
         logger.info(f"开始下载 whisper 模型: {model_size}")
         snapshot_download(repo_id, local_dir=model_path)
+        (Path(model_path) / ".download_complete").write_text("ok", encoding="utf-8")
         logger.info(f"whisper 模型下载完成: {model_size}")
         _downloading[model_size] = "done"
     except Exception as e:

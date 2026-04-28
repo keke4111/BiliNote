@@ -55,7 +55,7 @@ const SettingLayout = ({ Menu }: ISettingLayoutProps) => {
         </aside>
 
         {/* 右侧预览区域 */}
-        <main className="h-screen flex-1 overflow-hidden">
+        <main className="h-screen flex-1 overflow-x-hidden overflow-y-auto">
           <Outlet />
         </main>
       </div>
