@@ -212,3 +212,44 @@ MIT License
 ## ⭐ Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=JefferyHcool/BiliNote&type=Date)](https://www.star-history.com/#JefferyHcool/BiliNote&Date)
+
+## 本 fork 版本说明
+
+本版本基于原项目 BiliNote 修改，源码部署方式与原项目基本一致，但后端默认端口已调整为 `8483`。
+
+- 前端访问地址：`http://localhost:3015`
+- 后端默认地址：`http://localhost:8483`
+- 如果旧文档或旧配置中出现 `8000` 端口，请以本说明中的 `8483` 为准。
+
+### 新增功能
+
+- 增加 Windows 一键启动脚本。
+- 增加笔记分类、排序、回收站功能。
+- 增加笔记版本管理、版本删除进回收站、手动编辑版本功能。
+- 优化视频理解默认配置，增加重新生成确认和大模型总结进度显示。
+- 增加本地笔记库备份、导入导出、浏览器数据与目录备份数量核对。
+- 增加 Markdown 导出，以及 Markdown + 图片压缩包导出。
+- 增加按笔记清理下载缓存功能。
+- 优化设置页稳定性和模型配置体验。
+
+### 一键启动方式
+
+Windows 用户可以在项目根目录双击 `run.bat`，或在命令行执行：
+
+```bat
+run.bat
+```
+
+首次使用仍需先准备基础环境：
+
+- 安装 Python。
+- 安装 Node.js 和 pnpm。
+- 安装 FFmpeg，并加入系统 PATH。
+- 复制 `.env.example` 为 `.env`，按需填写配置。
+- 在网页设置中重新配置模型供应商、API Key、Cookie 和转写器。
+
+启动完成后访问：
+
+```text
+http://localhost:3015
+```
