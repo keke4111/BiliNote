@@ -253,3 +253,30 @@ run.bat
 ```text
 http://localhost:3015
 ```
+
+### Linux/macOS 一键启动方式
+
+Linux/macOS 用户可以使用 `run.sh` 启动源码开发环境。
+
+Ubuntu / Debian 示例依赖安装：
+
+```bash
+sudo apt update
+sudo apt install python3 python3-pip ffmpeg nodejs npm
+npm install -g pnpm
+```
+
+启动：
+
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+启动完成后访问：
+
+```text
+http://localhost:3015
+```
+
+CUDA/GPU 加速需要额外配置 NVIDIA 驱动和对应推理环境，`run.sh` 不会自动安装 GPU 依赖。
