@@ -193,6 +193,22 @@ def export_notes_store(data: NotesStoreSnapshotRequest):
         return R.error(msg=e)
 
 
+@router.post('/backup/export_notes_bundle')
+def export_notes_bundle(data: NotesStoreSnapshotRequest):
+    try:
+        content, filename = NotesBackupService.export_bundle(data.model_dump())
+        return StreamingResponse(
+            BytesIO(content),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename=\"notes-backup.zip\"; filename*=UTF-8''{quote(filename)}",
+            },
+        )
+    except Exception as e:
+        logger.exception(f"完整笔记库备份包导出失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get('/backup/list_note_backups')
 def list_note_backups():
     try:
@@ -207,6 +223,15 @@ def import_notes_store(data: BackupImportRequest):
     try:
         result = NotesBackupService.load_backup_file(data.filename)
         return R.success(data=result)
+    except Exception as e:
+        return R.error(msg=e)
+
+
+@router.post('/backup/import_notes_bundle')
+async def import_notes_bundle(file: UploadFile = File(...)):
+    try:
+        result = NotesBackupService.import_bundle(await file.read())
+        return R.success(data=result, msg='完整备份包导入成功')
     except Exception as e:
         return R.error(msg=e)
 

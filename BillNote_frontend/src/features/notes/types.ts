@@ -134,6 +134,12 @@ export interface NotesBackupImportPayload {
   snapshot: NotesBackupSnapshot
 }
 
+export interface NotesBackupBundleImportPayload {
+  snapshot: NotesBackupSnapshot
+  restoredImages: string[]
+  skippedImages: string[]
+}
+
 export type TrashItem =
   | { kind: 'task'; task: Task; deletedAt: string }
   | { kind: 'version'; deletedVersion: DeletedMarkdownVersion; task?: Task; deletedAt: string }

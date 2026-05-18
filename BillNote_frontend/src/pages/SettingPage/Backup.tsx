@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ChangeEvent } from 'react'
 import { toast } from 'react-hot-toast'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -17,7 +18,9 @@ import {
 } from '@/store/taskStore'
 import {
   exportNotesStoreSnapshot,
+  exportNotesBackupBundle,
   getNotesBackupStatus,
+  importNotesBackupBundle,
   importNotesStoreSnapshot,
   listNotesBackups,
   syncNotesStoreSnapshot,
@@ -49,7 +52,10 @@ export default function BackupPage() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [bundleExporting, setBundleExporting] = useState(false)
   const [importing, setImporting] = useState(false)
+  const [bundleImporting, setBundleImporting] = useState(false)
+  const bundleInputRef = useRef<HTMLInputElement | null>(null)
 
   const browserTaskCount = tasks.length
   const browserDeletedTaskCount = tasks.filter(task => task.isDeleted).length
@@ -116,6 +122,31 @@ export default function BackupPage() {
     }
   }
 
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
+  const handleExportBundle = async () => {
+    setBundleExporting(true)
+    try {
+      const result = await exportNotesBackupBundle(createSnapshot())
+      downloadBlob(result.blob, result.filename)
+      toast.success(`完整备份包导出成功：${result.filename}`)
+    } catch (error) {
+      console.error('导出完整备份包失败:', error)
+      toast.error('导出完整备份包失败')
+    } finally {
+      setBundleExporting(false)
+    }
+  }
+
   const handleImport = async () => {
     if (!selectedFile) {
       toast.error('请选择一个备份文件')
@@ -139,6 +170,31 @@ export default function BackupPage() {
       toast.error('导入笔记库失败')
     } finally {
       setImporting(false)
+    }
+  }
+
+  const handleBundleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+
+    setBundleImporting(true)
+    try {
+      const payload = await importNotesBackupBundle(file)
+      const result = importBackupSnapshot(payload.snapshot)
+      await syncNotesStoreSnapshot(
+        buildNotesBackupSnapshot(getPersistedTaskStoreState(useTaskStore.getState()))
+      )
+      await loadBackupData(true)
+
+      toast.success(
+        `完整备份导入完成：新增 ${result.addedTasks} 篇笔记，恢复 ${payload.restoredImages.length} 张图片，跳过 ${payload.skippedImages.length} 个文件`
+      )
+    } catch (error) {
+      console.error('导入完整备份包失败:', error)
+      toast.error('导入完整备份包失败')
+    } finally {
+      setBundleImporting(false)
     }
   }
 
@@ -235,7 +291,15 @@ export default function BackupPage() {
               ) : (
                 <Download className="mr-2 h-4 w-4" />
               )}
-              导出笔记库
+              导出笔记库 JSON
+            </Button>
+            <Button variant="outline" onClick={handleExportBundle} disabled={bundleExporting}>
+              {bundleExporting ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Download className="mr-2 h-4 w-4" />
+              )}
+              导出完整备份包
             </Button>
             <Button variant="outline" onClick={handleImport} disabled={importing || !selectedFile}>
               {importing ? (
@@ -245,6 +309,29 @@ export default function BackupPage() {
               )}
               导入所选备份
             </Button>
+            <Button
+              variant="outline"
+              onClick={() => bundleInputRef.current?.click()}
+              disabled={bundleImporting}
+            >
+              {bundleImporting ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Upload className="mr-2 h-4 w-4" />
+              )}
+              导入完整备份包
+            </Button>
+            <input
+              ref={bundleInputRef}
+              type="file"
+              accept=".zip,application/zip"
+              className="hidden"
+              onChange={handleBundleFileChange}
+            />
+          </div>
+
+          <div className="rounded-lg border border-blue-100 bg-blue-50 p-4 text-sm text-blue-700">
+            JSON 备份只包含笔记数据，不包含图片；完整备份包会额外包含本地截图和封面图片。
           </div>
 
           <div className="space-y-2">

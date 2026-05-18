@@ -1,7 +1,11 @@
 import json
+import re
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote, urlparse
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from app.utils.logger import get_logger
 
@@ -12,6 +16,14 @@ BACKUP_DIR = PROJECT_ROOT / "backup" / "notes"
 EXPORT_DIR = BACKUP_DIR / "exports"
 LATEST_BACKUP_FILE = BACKUP_DIR / "latest.task-storage.json"
 SCHEMA_VERSION = 1
+BACKEND_ROOT = PROJECT_ROOT / "backend"
+SCREENSHOT_DIR = (BACKEND_ROOT / "static" / "screenshots").resolve()
+COVER_DIR = (BACKEND_ROOT / "static" / "cover").resolve()
+ALLOWED_IMAGE_ROOTS = {
+    "screenshots": SCREENSHOT_DIR,
+    "cover": COVER_DIR,
+}
+MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
 
 class NotesBackupService:
@@ -41,6 +53,93 @@ class NotesBackupService:
             "deletedVersions": deleted_versions if isinstance(deleted_versions, list) else [],
             "currentTaskId": payload.get("currentTaskId"),
         }
+
+    @staticmethod
+    def _iter_markdown_contents(snapshot: dict):
+        for task in snapshot.get("tasks", []):
+            markdown = task.get("markdown") if isinstance(task, dict) else None
+            if isinstance(markdown, str):
+                yield markdown
+            elif isinstance(markdown, list):
+                for version in markdown:
+                    if isinstance(version, dict) and isinstance(version.get("content"), str):
+                        yield version["content"]
+
+        for item in snapshot.get("deletedVersions", []):
+            if not isinstance(item, dict):
+                continue
+            version = item.get("version")
+            if isinstance(version, dict) and isinstance(version.get("content"), str):
+                yield version["content"]
+
+    @staticmethod
+    def _resolve_local_image(url: str) -> Optional[tuple[str, Path]]:
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.scheme not in {"http", "https"}:
+            return None
+        if parsed.scheme in {"http", "https"} and parsed.hostname not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            return None
+
+        path = unquote(parsed.path)
+        if path.startswith("/static/screenshots/"):
+            image_type = "screenshots"
+        elif path.startswith("/static/cover/"):
+            image_type = "cover"
+        else:
+            return None
+
+        root = ALLOWED_IMAGE_ROOTS[image_type]
+        candidate = (root / Path(path).name).resolve()
+        if not (root == candidate or root in candidate.parents):
+            logger.warning(f"跳过不安全的备份图片路径: {url}")
+            return None
+        if not candidate.is_file():
+            logger.warning(f"跳过不存在的备份图片: {candidate}")
+            return None
+        return image_type, candidate
+
+    @staticmethod
+    def _collect_local_images(snapshot: dict) -> Dict[str, Path]:
+        images: Dict[str, Path] = {}
+        used_names: Dict[str, int] = {}
+
+        for markdown in NotesBackupService._iter_markdown_contents(snapshot):
+            for match in MARKDOWN_IMAGE_RE.finditer(markdown):
+                resolved = NotesBackupService._resolve_local_image(match.group(1).strip())
+                if resolved is None:
+                    continue
+
+                image_type, image_path = resolved
+                base_name = image_path.name
+                output_name = base_name
+                key_base = f"{image_type}/{base_name}".lower()
+                if key_base in used_names:
+                    used_names[key_base] += 1
+                    output_name = f"{image_path.stem}_{used_names[key_base]}{image_path.suffix}"
+                else:
+                    used_names[key_base] = 1
+
+                images[f"assets/{image_type}/{output_name}"] = image_path
+        return images
+
+    @staticmethod
+    def _safe_asset_target(member_name: str) -> Optional[Path]:
+        path = Path(member_name)
+        parts = path.parts
+        if len(parts) != 3 or parts[0] != "assets" or parts[1] not in ALLOWED_IMAGE_ROOTS:
+            return None
+        filename = Path(parts[2]).name
+        if filename != parts[2]:
+            return None
+        target = (ALLOWED_IMAGE_ROOTS[parts[1]] / filename).resolve()
+        root = ALLOWED_IMAGE_ROOTS[parts[1]]
+        if not (root == target or root in target.parents):
+            return None
+        return target
 
     @staticmethod
     def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -137,6 +236,61 @@ class NotesBackupService:
         NotesBackupService._write_json_atomic(export_path, payload)
         logger.info(f"笔记库导出完成: {export_path}")
         return NotesBackupService._serialize_backup_file(export_path)
+
+    @staticmethod
+    def export_bundle(snapshot: Optional[dict]) -> tuple[bytes, str]:
+        payload = NotesBackupService._sanitize_snapshot(snapshot)
+        images = NotesBackupService._collect_local_images(payload)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"notes-backup-{timestamp}.zip"
+
+        buffer = BytesIO()
+        with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as zip_file:
+            zip_file.writestr(
+                "task-storage.json",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+            for archive_name, image_path in images.items():
+                zip_file.write(image_path, archive_name)
+
+        logger.info(f"完整笔记库备份包导出完成: {filename}, images={len(images)}")
+        return buffer.getvalue(), filename
+
+    @staticmethod
+    def import_bundle(content: bytes) -> dict:
+        restored = []
+        skipped = []
+
+        with ZipFile(BytesIO(content), "r") as zip_file:
+            if "task-storage.json" not in zip_file.namelist():
+                raise ValueError("备份包缺少 task-storage.json")
+
+            snapshot = NotesBackupService._sanitize_snapshot(
+                json.loads(zip_file.read("task-storage.json").decode("utf-8"))
+            )
+
+            for member in zip_file.infolist():
+                if member.is_dir() or member.filename == "task-storage.json":
+                    continue
+
+                target = NotesBackupService._safe_asset_target(member.filename)
+                if target is None:
+                    skipped.append(member.filename)
+                    continue
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    skipped.append(member.filename)
+                    continue
+
+                target.write_bytes(zip_file.read(member))
+                restored.append(member.filename)
+
+        return {
+            "snapshot": snapshot,
+            "restoredImages": restored,
+            "skippedImages": skipped,
+        }
 
     @staticmethod
     def list_backups() -> List[dict]:
